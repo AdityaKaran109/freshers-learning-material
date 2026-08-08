@@ -1,0 +1,14 @@
+# Install PyTorch first, matched to your CUDA version, from https://pytorch.org
+# e.g. CUDA 12.8:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+torch>=2.4
+
+sentence-transformers>=5.0
+transformers>=4.40
+huggingface-hub>=0.24
+kagglehub>=0.3
+
+pandas>=2.0
+numpy>=1.26
+scikit-learn>=1.4
+matplotlib>=3.8

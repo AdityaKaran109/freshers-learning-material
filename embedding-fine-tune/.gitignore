@@ -1,0 +1,28 @@
+# Nothing generated belongs in git — every path below is rebuilt by the scripts.
+
+# Downloaded model weights (model_download.py)
+FremyCompany/
+*.safetensors
+*.bin
+
+# Downloaded dataset (model_download.py)
+shudhanshusingh/
+mukuldeshantri/
+*.csv
+
+# Prepared training data (prepare_dataset.py)
+data/
+
+# Trained models and training checkpoints (finetune.py)
+models/
+checkpoints/
+
+# Plots (test_model.py)
+*.png
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
