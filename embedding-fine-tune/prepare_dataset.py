@@ -1,21 +1,46 @@
-"""
+r"""
 prepare_dataset.py
 ------------------
 Turn the A-Z Medicine Dataset of India into training data for embedding
 fine-tuning.
 
-Output teaches the model: "two brands with the SAME active-ingredient
-composition should be close; a brand that only LOOKS similar (shares one salt
-but not the full composition) should not."
+Goal: two brands with the SAME active-ingredient composition should embed
+close together, and two brands whose NAMES look alike but whose compositions
+differ should not.
 
-Unlike the earlier 1mg dataset, this source has REAL composition columns
-(short_composition1 / short_composition2), so nothing is guessed from titles.
+    Mox 500mg      = Amoxicillin                 \  same molecule -> CLOSE
+    Novamox 500    = Amoxicillin                 /
 
-Produces:
-  train_pairs.csv / val_pairs.csv       -> (text_a, text_b) positive pairs
-  train_triplets.csv / val_triplets.csv -> (anchor, positive, hard_negative)
+    Ibugesic 400   = Ibuprofen                   \  near-identical names,
+    Ibugesic Plus  = Ibuprofen + Paracetamol     /  different -> FAR APART
 
-Train and val use DISJOINT compositions, so val brands are unseen in training.
+The second case is the hard one, and it drives three design decisions:
+
+1. SPLIT BY BRAND, NOT BY COMPOSITION.
+   Holding out whole compositions asks the model to recognise a molecule it
+   has never seen named even once, which a brand name alone cannot support.
+   Instead every composition stays in training and unseen BRANDS are held
+   out -- the real task, "a new brand launches for a known salt".
+   A small set of whole compositions is still held out separately as a
+   deliberately hard secondary metric.
+
+2. MINE LOOK-ALIKE NEGATIVES FROM BRAND ROOTS.
+   ~2.8k brand roots span more than one composition (Ibugesic / Ibugesic
+   Plus, Mox / Mox CV). These are exactly the pairs models get wrong, so
+   they become explicit hard negatives instead of being discarded.
+
+3. GROUND EVERY BRAND TO ITS COMPOSITION TEXT.
+   Pairing "Mox 500mg" with "Amoxicillin" gives the model a target the
+   biomedical base model already understands, rather than only pushing
+   arbitrary brand strings toward each other.
+
+Produces in --out:
+    train_pairs.csv            (text_a, text_b)
+    train_triplets.csv         (anchor, positive, hard_negative)
+    val_pairs.csv              unseen brands, seen compositions
+    val_triplets.csv           unseen brands, seen compositions   <- primary
+    val_lookalike_triplets.csv only root-collision negatives       <- the hard metric
+    unseen_comp_triplets.csv   compositions never trained on       <- secondary
 
 Run:
   python prepare_dataset.py \
@@ -96,6 +121,13 @@ _SALT_FORM_RE = re.compile(
     r"\s+(?:" + "|".join(sorted(SALT_FORM_SUFFIXES, key=len, reverse=True)) + r")$"
 )
 
+# Strings pandas would read back as NaN (a brand really is named "None").
+NA_SENTINELS = {s.lower() for s in pd._libs.parsers.STR_NA_VALUES} | {""}
+
+
+def is_writable_text(s):
+    return isinstance(s, str) and s.strip().lower() not in NA_SENTINELS
+
 
 def resolve_col(df, aliases):
     """Match a dataframe column case-insensitively against known aliases."""
@@ -169,14 +201,6 @@ def composition_key(salt1, salt2, strip_salt_forms=True):
     return " + ".join(salts)
 
 
-# Strings pandas would read back as NaN (a brand really is named "None").
-NA_SENTINELS = {s.lower() for s in pd._libs.parsers.STR_NA_VALUES} | {""}
-
-
-def is_writable_text(s):
-    return isinstance(s, str) and s.strip().lower() not in NA_SENTINELS
-
-
 def comp_text(key):
     """Human-readable composition string used as a text anchor."""
     return " + ".join(part.title() for part in key.split(" + "))
@@ -187,19 +211,19 @@ def comp_text(key):
 # ----------------------------------------------------------------------
 def clean_name(n):
     """'Augmentin 625 Duo Tablet' -> 'Augmentin 625 Duo'"""
-    n = re.sub(r"\s+", " ", str(n)).strip()
+    original = re.sub(r"\s+", " ", str(n)).strip()
+    n = original
     prev = None
     while prev != n:                       # "Tablet SR", then a second form word
         prev = n
         n = _FORM_RE.sub("", n).strip()
-    return n or re.sub(r"\s+", " ", str(n)).strip()
+    return n or original
 
 
 def brand_root(n):
     """'Calpol 500mg' -> 'Calpol'. Bare brand token, before any strength."""
-    tokens = n.split()
     root = []
-    for tok in tokens:
+    for tok in n.split():
         if re.search(r"\d", tok):          # first token with a digit = strength
             break
         root.append(tok)
@@ -256,12 +280,13 @@ def cover_pairs(items, rounds, max_pairs, rng):
 # ----------------------------------------------------------------------
 def build(csv_path, out_dir, name_col="name",
           c1="short_composition1", c2="short_composition2",
-          max_pairs_per_group=20, val_frac=0.15,
-          max_triplets_per_group=10, add_comp_anchors=True,
-          add_brand_roots=True, strip_salt_forms=True,
-          drop_discontinued=False, min_group_size=2,
-          keep_truncated=False, pair_rounds=1, root_pairs=1,
-          triplet_frac=0.25):
+          max_pairs_per_group=20, pair_rounds=1, root_pairs=1,
+          max_triplets_per_group=10, triplet_frac=0.25,
+          root_collision_anchors=6, prefix_len=5, prefix_collision_anchors=2,
+          val_frac=0.12, unseen_comp_frac=0.05,
+          add_comp_anchors=True, add_brand_roots=True,
+          strip_salt_forms=True, drop_discontinued=False,
+          min_group_size=2, keep_truncated=False):
 
     rng = random.Random(42)
 
@@ -307,112 +332,224 @@ def build(csv_path, out_dir, name_col="name",
     print("Unique brands:", len(df))
 
     name_to_key = dict(zip(df["clean_name"], df["comp_key"]))
-
-    # ---- brand roots: bare "Calpol" alongside "Calpol 500mg" ----
-    # Only keep a root that maps to exactly ONE composition across the dataset,
-    # so "Novamox" (amoxicillin) is not confused with "Novamox CV" (+clav).
-    root_variants = defaultdict(set)
-    if add_brand_roots:
-        root_keys = defaultdict(set)
-        for name, key in name_to_key.items():
-            root = brand_root(name)
-            if root and root != name:
-                root_keys[root].add(key)
-        for name, key in name_to_key.items():
-            root = brand_root(name)
-            if root and root != name and len(root_keys[root]) == 1 and root not in name_to_key:
-                root_variants[key].add(root)
-        print(f"Unambiguous brand roots recovered: {sum(len(v) for v in root_variants.values())}")
-
-    # ---- group brands by identical composition ----
     groups = defaultdict(list)
     for name, key in name_to_key.items():
         groups[key].append(name)
-    multi = {k: v for k, v in groups.items() if len(v) >= min_group_size}
+    multi = {k: sorted(v) for k, v in groups.items() if len(v) >= min_group_size}
     print(f"Compositions with >={min_group_size} brands: {len(multi)}")
 
-    # ---- split by COMPOSITION so val brands are unseen in train ----
-    keys = sorted(multi)
-    rng.shuffle(keys)
-    n_val = int(len(keys) * val_frac)
-    val_keys, train_keys = set(keys[:n_val]), set(keys[n_val:])
-    print(f"train compositions: {len(train_keys)}   val compositions: {len(val_keys)}")
+    # ---- root index: which compositions does each brand root cover? ----
+    root_index = defaultdict(lambda: defaultdict(list))   # root -> key -> [names]
+    for name, key in name_to_key.items():
+        root = brand_root(name)
+        if root and root != name:
+            root_index[root][key].append(name)
+    collide = {r: ks for r, ks in root_index.items() if len(ks) > 1}
+    print(f"Brand roots spanning >1 composition (look-alike negatives): {len(collide)}")
 
-    def make_pairs(key_set):
+    # Root matching is exact, so it misses "Mox 500mg" vs "Moxikind-CV 625".
+    # A shared character prefix catches those: same opening letters, different
+    # composition. Coincidental collisions are fine here -- the pair still looks
+    # alike to a tokenizer, which is precisely what must be told apart.
+    prefix_index = defaultdict(lambda: defaultdict(list))
+    for name, key in name_to_key.items():
+        flat = re.sub(r"[^a-z0-9]", "", name.lower())
+        if len(flat) >= prefix_len:
+            prefix_index[flat[:prefix_len]][key].append(name)
+    prefix_collide = {p: ks for p, ks in prefix_index.items() if len(ks) > 1}
+    print(f"Name prefixes ({prefix_len} chars) spanning >1 composition: {len(prefix_collide)}")
+
+    # ------------------------------------------------------------------
+    # SPLIT 1: a few whole compositions held out entirely (hard metric)
+    # ------------------------------------------------------------------
+    splittable = [k for k, v in multi.items() if len(v) >= 4]
+    rng.shuffle(splittable)
+    n_unseen = int(len(multi) * unseen_comp_frac)
+    unseen_keys = set(splittable[:n_unseen])
+    seen_keys = [k for k in multi if k not in unseen_keys]
+    print(f"Held-out compositions (never trained): {len(unseen_keys)}")
+
+    # ------------------------------------------------------------------
+    # SPLIT 2: within every remaining composition, hold out BRANDS
+    # ------------------------------------------------------------------
+    train_of, val_of = {}, {}
+    for k in seen_keys:
+        brands = list(multi[k])
+        rng.shuffle(brands)
+        # need >=2 brands on each side to form a pair
+        n_val = int(len(brands) * val_frac)
+        if len(brands) < 6:
+            n_val = 0
+        n_val = max(0, min(n_val, len(brands) - 2))
+        if n_val == 1:
+            n_val = 0
+        val_of[k] = sorted(brands[:n_val])
+        train_of[k] = sorted(brands[n_val:])
+    n_train_brands = sum(len(v) for v in train_of.values())
+    n_val_brands = sum(len(v) for v in val_of.values())
+    print(f"Brands -> train: {n_train_brands}   val (unseen brand, seen composition): "
+          f"{n_val_brands}")
+
+    # Brand roots are derived from TRAIN brands only, and only when the root maps
+    # to exactly one composition -- "Novamox" must not be merged with "Novamox CV".
+    root_alias = defaultdict(set)
+    if add_brand_roots:
+        train_names = {n for v in train_of.values() for n in v}
+        for root, keys in root_index.items():
+            if len(keys) != 1 or root in name_to_key:
+                continue
+            key = next(iter(keys))
+            if key in train_of and any(n in train_names for n in keys[key]):
+                root_alias[key].add(root)
+        print(f"Unambiguous brand roots usable as training aliases: "
+              f"{sum(len(v) for v in root_alias.values())}")
+
+    # ------------------------------------------------------------------
+    # Pair / triplet construction, run once per split
+    # ------------------------------------------------------------------
+    def make_pairs(split_of, with_roots):
         rows = []
-        for k in key_set:
-            brands = sorted(multi[k])
+        for k, brands in split_of.items():
+            if len(brands) < 2:
+                continue
             rows.extend(cover_pairs(brands, pair_rounds, max_pairs_per_group, rng))
-            # bare-brand variants pair with their full titles
-            for root in sorted(root_variants.get(k, ())):
-                for brand in rng.sample(brands, min(root_pairs, len(brands))):
-                    rows.append((root, brand))
-            # composition text as an explicit anchor
+            if with_roots:
+                for root in sorted(root_alias.get(k, ())):
+                    for brand in rng.sample(brands, min(root_pairs, len(brands))):
+                        rows.append((root, brand))
+            # ground EVERY brand to its composition text
             if add_comp_anchors:
                 anchor = comp_text(k)
-                for brand in rng.sample(brands, min(3, len(brands))):
+                for brand in brands:
                     rows.append((brand, anchor))
         rng.shuffle(rows)
         return pd.DataFrame(rows, columns=["text_a", "text_b"])
 
-    train_pairs = make_pairs(train_keys)
-    val_pairs = make_pairs(val_keys)
-
-    # ---- hard negatives: shares a salt, DIFFERENT full composition ----
-    # e.g. "Novamox 500" (amoxicillin) vs "Novamox CV 625" (amoxicillin + clav)
+    # compositions that share at least one salt -- the "looks related" pool
     salt_to_keys = defaultdict(list)
-    for k in groups:
+    for k in multi:
         for salt in k.split(" + "):
             salt_to_keys[salt].append(k)
 
-    def make_triplets(key_set):
-        rows = []
-        allowed = key_set
-        for k in key_set:
-            brands = multi[k]
-            salts = k.split(" + ")
-            # candidate compositions that share a salt but are not identical
-            neigh = {nk for salt in salts for nk in salt_to_keys[salt]
-                     if nk != k and nk in allowed}
-            if not neigh:
-                neigh = {nk for salt in salts for nk in salt_to_keys[salt] if nk != k}
+    def make_triplets(split_of, with_roots, lookalike_only=False, neg_of=None):
+        """Three kinds of hard negative.
+
+        A) shares a salt, different full composition  (Mox vs Mox CV)
+        B) shares a brand ROOT, different composition (Ibugesic vs Ibugesic Plus)
+        C) composition text as anchor, grounded against a salt-sharing rival
+
+        anchor and positive always come from split_of, so they are unseen at
+        evaluation time. neg_of supplies the negatives and defaults to the same
+        split; evaluation sets widen it to every brand, since a negative the
+        model trained on still makes a valid "is the positive closer?" test and
+        root collisions are too rare to survive a 12% slice.
+        """
+        rows, counts = [], defaultdict(int)
+        available = {k: set(v) for k, v in split_of.items()}
+        neg_of = split_of if neg_of is None else neg_of
+        neg_available = {k: set(v) for k, v in neg_of.items()}
+
+        # ---- B) look-alike negatives from colliding brand roots ----
+        for root, keys in collide.items():
+            for k in keys:
+                if not available.get(k):
+                    continue
+                mine = [n for n in keys[k] if n in available[k]]
+                others = [n for ok, names in keys.items() if ok != k
+                          for n in names if n in neg_available.get(ok, ())]
+                pool = [b for b in split_of[k] if b not in mine]
+                if not mine or not others or not pool:
+                    continue
+                for anchor in rng.sample(mine, min(root_collision_anchors, len(mine))):
+                    rows.append((anchor, rng.choice(pool), rng.choice(others)))
+                    counts["root_collision"] += 1
+
+        # ---- D) look-alike negatives from shared name prefixes ----
+        for prefix, keys in prefix_collide.items():
+            for k in keys:
+                if not available.get(k):
+                    continue
+                mine = [n for n in keys[k] if n in available[k]]
+                others = [n for ok, names in keys.items() if ok != k
+                          for n in names if n in neg_available.get(ok, ())]
+                pool = [b for b in split_of[k] if b not in mine]
+                if not mine or not others or not pool:
+                    continue
+                for anchor in rng.sample(mine, min(prefix_collision_anchors, len(mine))):
+                    rows.append((anchor, rng.choice(pool), rng.choice(others)))
+                    counts["prefix_collision"] += 1
+        if lookalike_only:
+            rng.shuffle(rows)
+            return pd.DataFrame(rows, columns=["anchor", "positive", "hard_negative"]), counts
+
+        # ---- A) salt-overlap negatives ----
+        for k, brands in split_of.items():
+            if len(brands) < 2:
+                continue
+            neigh = [nk for salt in k.split(" + ") for nk in salt_to_keys[salt]
+                     if nk != k and neg_available.get(nk)]
             if not neigh:
                 continue
-            neigh = sorted(neigh)
-            # scale anchors with group size so large groups aren't under-sampled
+            neigh = sorted(set(neigh))
             n_trip = min(len(brands),
                          max(max_triplets_per_group, int(len(brands) * triplet_frac)))
             for anchor in rng.sample(brands, n_trip):
                 positive = rng.choice([b for b in brands if b != anchor])
-                neg_key = rng.choice(neigh)
-                negative = rng.choice(groups[neg_key])
+                negative = rng.choice(sorted(neg_available[rng.choice(neigh)]))
                 rows.append((anchor, positive, negative))
-            # bare brand root as an anchor too
-            for root in sorted(root_variants.get(k, ())):
-                neg_key = rng.choice(neigh)
-                rows.append((root, rng.choice(brands), rng.choice(groups[neg_key])))
-        rng.shuffle(rows)
-        return pd.DataFrame(rows, columns=["anchor", "positive", "hard_negative"])
+                counts["salt_overlap"] += 1
 
-    train_triplets = make_triplets(train_keys)
-    val_triplets = make_triplets(val_keys)
+            # ---- C) composition text anchored against a rival composition ----
+            if add_comp_anchors:
+                neg_key = rng.choice(neigh)
+                rows.append((comp_text(k), rng.choice(brands),
+                             rng.choice(sorted(neg_available[neg_key]))))
+                counts["comp_anchor"] += 1
+
+            if with_roots:
+                for root in sorted(root_alias.get(k, ())):
+                    neg_key = rng.choice(neigh)
+                    rows.append((root, rng.choice(brands),
+                                 rng.choice(sorted(neg_available[neg_key]))))
+                    counts["root_alias"] += 1
+
+        rng.shuffle(rows)
+        return pd.DataFrame(rows, columns=["anchor", "positive", "hard_negative"]), counts
+
+    unseen_of = {k: multi[k] for k in unseen_keys}
+
+    train_pairs = make_pairs(train_of, with_roots=True)
+    val_pairs = make_pairs(val_of, with_roots=False)
+    train_triplets, train_counts = make_triplets(train_of, with_roots=True)
+    # Evaluation sets keep anchor+positive unseen but draw negatives from the
+    # whole catalogue, so root collisions are not decimated by the 12% slice.
+    val_triplets, val_counts = make_triplets(val_of, with_roots=False, neg_of=multi)
+    val_lookalike, look_counts = make_triplets(val_of, with_roots=False,
+                                               lookalike_only=True, neg_of=multi)
+    unseen_triplets, unseen_counts = make_triplets(unseen_of, with_roots=False, neg_of=multi)
 
     # ---- save ----
     os.makedirs(out_dir, exist_ok=True)
-    train_pairs.to_csv(f"{out_dir}/train_pairs.csv", index=False)
-    val_pairs.to_csv(f"{out_dir}/val_pairs.csv", index=False)
-    train_triplets.to_csv(f"{out_dir}/train_triplets.csv", index=False)
-    val_triplets.to_csv(f"{out_dir}/val_triplets.csv", index=False)
+    outputs = {
+        "train_pairs": train_pairs,
+        "val_pairs": val_pairs,
+        "train_triplets": train_triplets,
+        "val_triplets": val_triplets,
+        "val_lookalike_triplets": val_lookalike,
+        "unseen_comp_triplets": unseen_triplets,
+    }
+    for stem, frame in outputs.items():
+        frame.to_csv(f"{out_dir}/{stem}.csv", index=False)
 
     print("\n=== OUTPUT ===")
-    print(f"train_pairs    : {len(train_pairs):>7}  -> {out_dir}/train_pairs.csv")
-    print(f"val_pairs      : {len(val_pairs):>7}  -> {out_dir}/val_pairs.csv")
-    print(f"train_triplets : {len(train_triplets):>7}  -> {out_dir}/train_triplets.csv")
-    print(f"val_triplets   : {len(val_triplets):>7}  -> {out_dir}/val_triplets.csv")
-    print("\nSample positive pairs:")
-    print(train_pairs.head(6).to_string(index=False))
-    print("\nSample hard-negative triplets:")
-    print(train_triplets.head(6).to_string(index=False))
+    for stem, frame in outputs.items():
+        print(f"{stem:24}: {len(frame):>7}  -> {out_dir}/{stem}.csv")
+    print(f"\ntrain triplet mix: {dict(train_counts)}")
+    print(f"val   triplet mix: {dict(val_counts)}")
+    print(f"val look-alike only: {dict(look_counts)}")
+
+    print("\nSample look-alike triplets (anchor / same composition / LOOKS alike but differs):")
+    print(val_lookalike.head(8).to_string(index=False))
 
 
 if __name__ == "__main__":
@@ -431,7 +568,10 @@ if __name__ == "__main__":
     ap.add_argument("--max_triplets_per_group", type=int, default=10)
     ap.add_argument("--triplet_frac", type=float, default=0.25,
                     help="Fraction of a group's brands used as triplet anchors")
-    ap.add_argument("--val_frac", type=float, default=0.15)
+    ap.add_argument("--val_frac", type=float, default=0.12,
+                    help="Fraction of BRANDS held out inside each composition")
+    ap.add_argument("--unseen_comp_frac", type=float, default=0.05,
+                    help="Fraction of whole compositions held out entirely")
     ap.add_argument("--min_group_size", type=int, default=2)
     ap.add_argument("--no_comp_anchors", action="store_true",
                     help="Do not pair brands with their composition text")
@@ -446,14 +586,15 @@ if __name__ == "__main__":
 
     build(args.csv, args.out, args.name_col, args.c1, args.c2,
           max_pairs_per_group=args.max_pairs_per_group,
-          val_frac=args.val_frac,
+          pair_rounds=args.pair_rounds,
+          root_pairs=args.root_pairs,
           max_triplets_per_group=args.max_triplets_per_group,
+          triplet_frac=args.triplet_frac,
+          val_frac=args.val_frac,
+          unseen_comp_frac=args.unseen_comp_frac,
           add_comp_anchors=not args.no_comp_anchors,
           add_brand_roots=not args.no_brand_roots,
           strip_salt_forms=not args.keep_salt_forms,
           drop_discontinued=args.drop_discontinued,
           min_group_size=args.min_group_size,
-          keep_truncated=args.keep_truncated,
-          pair_rounds=args.pair_rounds,
-          root_pairs=args.root_pairs,
-          triplet_frac=args.triplet_frac)
+          keep_truncated=args.keep_truncated)
