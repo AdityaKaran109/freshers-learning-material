@@ -25,6 +25,18 @@ triplets the base model picks the correct one **16.9%** of the time — chance i
 50%, so it is not merely ignorant, it is reliably pulled the wrong way by shared
 spelling. Fixing that is what this project is about.
 
+After fine-tuning, asking the question that actually matters — *given this brand
+name, which of 2,390 compositions is it?*
+
+| | base model | fine-tuned |
+|---|---|---|
+| top-1 | 0.052 | **0.312** |
+| top-5 | 0.121 | **0.523** |
+| median rank | 179 | **5** |
+
+![before](before.png)
+![after](after.png)
+
 ## What's in here
 
 Code **and** the prepared training data. Not included: model weights,
@@ -36,6 +48,7 @@ model_download.py    base model + dataset download          (run 1st)
 prepare_dataset.py   dataset -> pairs and triplets          (run 2nd, optional)
 finetune.py          the fine-tune                          (run 3rd, needs a CUDA GPU)
 test_model.py        metrics + PCA plot                     (run 4th)
+eval_retrieval.py    brand -> composition retrieval         (run 4th)
 data/                prepared training data, ready to use
 requirements.txt
 ```
@@ -185,31 +198,65 @@ fell from 0.120 to 0.065 while normalized margin rose from 0.87 to 1.40 and
 nearest-neighbour accuracy went 0.239 → 0.430. Selecting on raw margin would
 have discarded the better model.
 
-### Baseline to beat
+## Results
 
-`BioLORD-2023`, untrained, on the held-out sets in `data/`:
+One epoch of `CachedGISTEmbedLoss` at batch 512, lr 1e-5. A second epoch changed
+nothing — the run plateaued around epoch 0.8.
 
-| metric | base model |
-|---|---|
-| composition nearest-neighbour accuracy | 0.2394 |
-| held-out brand triplets | 0.3322 |
-| **look-alike triplets** | **0.1685** |
-| unseen-composition triplets | 0.2690 |
-| normalized margin | 0.8667 |
+Held-out sets in `data/`:
 
-Every triplet number is below the 0.50 chance line — the base model is actively
-misled by name similarity. Note these are far harsher than the 0.9267 an earlier
-version of this project reported, because that number came from *randomly*
-sampled negatives and from labels inferred from product titles. Lower numbers
-that you can trust beat higher ones you cannot.
+| metric | base | fine-tuned | |
+|---|---|---|---|
+| composition nearest-neighbour accuracy | 0.2394 | **0.4894** | |
+| held-out brand triplets | 0.3322 | **0.5235** | |
+| look-alike triplets | 0.1685 | **0.3870** | still below chance |
+| unseen-composition triplets | 0.2690 | **0.4333** | still below chance |
+| normalized margin | 0.8667 | **1.6360** | |
+| raw margin | 0.1197 | 0.0839 | scale artifact — see above |
+
+On the 28-brand probe in `test_model.py`, nearest-neighbour accuracy goes
+**0.679 → 0.857** (24/28), and the look-alike pairs that were inverted now sort
+correctly:
+
+```
+Mox 500mg vs Novamox 500   same        0.9137   ✓ above
+Mox 500mg vs Mox CV 625    different   0.8369
+```
+
+In the base model those two were nearly tied (0.6318 vs 0.6076).
+
+**Generalization, not memorization.** The retrieval numbers split by whether the
+model saw the brand name during training:
+
+| split | top-1 | top-5 | median rank |
+|---|---|---|---|
+| seen brands | 0.3120 | 0.5247 | 5 |
+| unseen brands | 0.3097 | 0.5197 | 5 |
+
+Identical. The model did not build a lookup table — it learned that Indian brand
+morphology encodes the salt (`Cefixus` → cefixime, `-mox` → amoxicillin), and
+that transfers to names it has never seen. Run `eval_retrieval.py` to reproduce
+the split; reporting a single blended number would hide which ability you are
+actually buying.
+
+## What still fails
+
+`Ibugesic 400` vs `Ibugesic Plus` remains **inverted**: 0.9066 for the wrong
+pair against 0.8795 for the right one. The gap narrowed from −0.062 to −0.027
+but did not close, and on the full look-alike set the model scores 0.387 —
+better than the base model's 0.169, but still under the 0.50 chance line. Where
+a brand family spans two compositions and the only distinguishing token is a
+suffix like `Plus` or `LS`, this is not solved.
+
+Ideas not yet tried: a higher learning rate (the run plateaued early, so lr 3e-5
+is a cheaper experiment than more epochs), oversampling look-alike triplets
+relative to the 371k easy positives, or a character-aware model that can weigh a
+two-letter suffix more heavily than subword pooling does.
 
 ## Known limitations
 
-- Brand → composition is substantially a **memorization** task. For brands in
-  the catalogue this works well; for a genuinely novel brand name only
-  morphology helps (`-cef` → cephalosporin, `CV` → clavulanate), so expect
-  limited generalization there. The `unseen_comp_triplets.csv` score is the
-  honest read on that.
 - The source stores at most two salts per medicine, so true three-ingredient
   products cannot be represented and are dropped.
 - Indian brands, allopathy only. `Advil` is not in the dataset.
+- 2,390 compositions have ≥2 brands; single-brand compositions are excluded
+  from training and from the retrieval catalogue.
