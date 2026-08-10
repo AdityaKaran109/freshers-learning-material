@@ -3,11 +3,14 @@ __pycache__/
 *.py[cod]
 
 # Downloaded datasets and training outputs
-data/
-runs/
+/data/
+/runs/
+whisper-bhojpuri-lora/data/
+whisper-bhojpuri-lora/runs/
 
 # Generated evaluation artifacts
-*.jsonl
+/*.jsonl
+whisper-bhojpuri-lora/*.jsonl
 
 # Local configuration and secrets
 .env
