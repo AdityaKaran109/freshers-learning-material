@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# Downloaded datasets and training outputs
+data/
+runs/
+
+# Generated evaluation artifacts
+*.jsonl
+
+# Local configuration and secrets
+.env
+*.env
+*.enf
+.claude/
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

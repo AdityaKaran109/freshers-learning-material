@@ -1,0 +1,30 @@
+# RTX 5080 is Blackwell (sm_120) -- torch must be a cu128 build.
+# Install torch FIRST, from the CUDA 12.8 index:
+#   python -m pip install --upgrade torch --index-url https://download.pytorch.org/whl/cu128
+# Then:
+#   python -m pip install -r requirements.txt
+#
+# Always use `python -m pip`, never bare `pip` -- on a conda base env the bare
+# command often resolves to the system pip and fails with
+# externally-managed-environment.
+
+# PIN. datasets >= 4 dropped the soundfile audio backend and requires
+# `torchcodec` (plus FFmpeg shared libraries) to encode OR decode the Audio
+# feature. All three scripts here are written to use soundfile precisely to
+# avoid that dependency, so datasets 5.x fails with:
+#   ImportError: To support encoding audio data, please install 'torchcodec'.
+# 3.6.0 is the last line that decodes audio with soundfile.
+datasets==3.6.0
+
+transformers
+accelerate
+peft
+jiwer
+soundfile
+librosa
+numpy
+
+# Verified working on this machine (Windows 11, RTX 5080, Python 3.12.10):
+#   torch 2.11.0+cu128   transformers 5.14.1   datasets 3.6.0
+#   accelerate 1.14.0    peft 0.19.1           jiwer 4.0.0
+#   soundfile 0.14.0     librosa 0.11.0        numpy 2.4.6
